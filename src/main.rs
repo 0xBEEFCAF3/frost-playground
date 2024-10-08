@@ -100,10 +100,9 @@ fn connect_to_bitcoind() -> bitcoincore_rpc::Client {
 }
 
 fn psbt_to_sign(
-    txid: &bitcoin::Txid,
-    vout: usize,
-    amount: bitcoin::Amount,
+    outpoint: bitcoin::OutPoint,
     prev_output: bitcoin::TxOut,
+    amount_to_send: bitcoin::Amount,
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
 ) -> Result<bitcoin::psbt::Psbt, anyhow::Error> {
     let wallet_address = bitcoind_client
@@ -114,16 +113,13 @@ fn psbt_to_sign(
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint {
-                txid: txid.to_owned(),
-                vout: vout as u32,
-            },
+            previous_output: outpoint,
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: bitcoin::Sequence(0),
             witness: bitcoin::Witness::new(),
         }],
         output: vec![bitcoin::TxOut {
-            value: amount,
+            value: amount_to_send,
             script_pubkey: wallet_address.script_pubkey(),
         }],
     };
@@ -156,8 +152,82 @@ pub fn calculate_sighash(
     Ok(sighash)
 }
 
-/* TESTS */
+fn do_signing(
+    keys: &BTreeMap<Identifier, SecretShare>,
+    pk_package: &PublicKeyPackage,
+    outpoint: bitcoin::OutPoint,
+    bitcoind_client: &impl bitcoincore_rpc::RpcApi,
+    txout: bitcoin::TxOut,
+    amount_to_send: bitcoin::Amount,
+) -> Result<(frost::Signature, bitcoin::psbt::Psbt), anyhow::Error> {
+    // Round 1
+    let id1 = &Identifier::try_from(1u16).expect("valid identifier");
+    let id2 = &Identifier::try_from(2u16).expect("valid identifier");
+    let mut commitment_map = BTreeMap::new();
+    let mut nonce_map = BTreeMap::new();
 
+    let (nonces, commitments) = participant(keys.get(id1).unwrap()).unwrap();
+    commitment_map.insert(id1.clone(), commitments);
+    nonce_map.insert(id1.clone(), nonces);
+
+    let (nonces, commitments) = participant(keys.get(id2).unwrap()).unwrap();
+    commitment_map.insert(id2.clone(), commitments);
+    nonce_map.insert(id2.clone(), nonces);
+
+    // Signing round 2
+    let mut psbt = psbt_to_sign(
+        outpoint,
+        txout,
+        amount_to_send,
+        bitcoind_client,
+    )?;
+    let sighash = calculate_sighash(&psbt, 0)?;
+
+    let sig_target = frost::SigningTarget::new(
+        sighash.to_raw_hash().to_byte_array().as_slice(),
+        frost::SigningParameters {
+            tapscript_merkle_root: None,
+        },
+    );
+    let signing_package = frost::SigningPackage::new(commitment_map, sig_target.clone());
+
+    let mut signature_shares = BTreeMap::new();
+
+    // Singer 1 sign
+    let signature_share = participant_sign(
+        &nonce_map.get(id1).unwrap(),
+        &signing_package,
+        &keys.get(id1).unwrap().to_owned().try_into().unwrap(),
+    )
+    .unwrap();
+    signature_shares.insert(id1.clone(), signature_share);
+
+    // Singer 2 sign
+    let signature_share = participant_sign(
+        &nonce_map.get(id2).unwrap(),
+        &signing_package,
+        &keys.get(id2).unwrap().to_owned().try_into().unwrap(),
+    )
+    .unwrap();
+    signature_shares.insert(id2.clone(), signature_share);
+
+    println!("signing package {:?}", signing_package);
+    let group_signature =
+        frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
+
+    println!("group_signature: {:?}", group_signature);
+     // Verify
+     let is_signature_valid = pk_package
+     .verifying_key()
+     .verify(sig_target, &group_signature);
+
+    println!("is_signature_valid: {:?}", is_signature_valid);
+    assert!(is_signature_valid.is_ok());
+
+    Ok((group_signature, psbt))
+}
+
+/* TESTS */
 fn test_key_spend_with_trusted_setup(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
 ) -> Result<(), anyhow::Error> {
@@ -185,11 +255,11 @@ fn test_key_spend_with_trusted_setup(
     );
     println!("Key spend address: {}", key_spend_address);
 
-    let amount_to_send = bitcoin::Amount::from_sat(100_000);
+    let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
         .send_to_address(
             &key_spend_address,
-            amount_to_send,
+            amount_to_recieve,
             None,
             None,
             None,
@@ -203,87 +273,31 @@ fn test_key_spend_with_trusted_setup(
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
     println!("key spend txid: {}", txid);
-    let tx = bitcoind_client.get_transaction(&txid, None).unwrap().transaction().expect("get transaction");
+    let tx = bitcoind_client
+        .get_transaction(&txid, None)
+        .unwrap()
+        .transaction()
+        .expect("get transaction");
     let vout = tx
         .output
         .iter()
         .position(|v| v.script_pubkey == key_spend_address.script_pubkey())
         .unwrap();
-
-    let id1 = &Identifier::try_from(1u16).expect("valid identifier");
-    let id2 = &Identifier::try_from(2u16).expect("valid identifier");
-    let mut commitment_map = BTreeMap::new();
-    let mut nonce_map = BTreeMap::new();
-
-    // signing round 1
-    let (nonces, commitments) = participant(keys.0.get(id1).unwrap()).unwrap();
-    commitment_map.insert(id1.clone(), commitments);
-    nonce_map.insert(id1.clone(), nonces);
-
-    let (nonces, commitments) = participant(keys.0.get(id2).unwrap()).unwrap();
-    commitment_map.insert(id2.clone(), commitments);
-    nonce_map.insert(id2.clone(), nonces);
-
-    // Signing round 2
-    let mut psbt = psbt_to_sign(
-        &txid,
-        vout,
-        // Rest to fees
-        bitcoin::Amount::from_sat(10_000),
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+    let (group_signature, mut psbt) = do_signing(
+        &keys.0,
+        &pk_package,
+        outpoint,
+        bitcoind_client,
         bitcoin::TxOut {
-            value: amount_to_send,
+            value: amount_to_recieve,
             script_pubkey: key_spend_address.script_pubkey(),
         },
-        bitcoind_client,
+        bitcoin::Amount::from_sat(10_000),
     )?;
-    let sighash = calculate_sighash(&psbt, 0)?;
-
-    let sig_target = frost::SigningTarget::new(
-        sighash.to_raw_hash().to_byte_array().as_slice(),
-        frost::SigningParameters {
-            tapscript_merkle_root: None,
-        },
-    );
-    let signing_package = frost::SigningPackage::new(commitment_map, sig_target.clone());
-
-    // Check signing package serialization and deserialization fine
-    let encoded = signing_package.serialize().unwrap();
-    let decoded = frost::SigningPackage::deserialize(&encoded).unwrap();
-    assert_eq!(decoded, signing_package);
-
-    let mut signature_shares = BTreeMap::new();
-
-    // Singer 1 sign
-    let signature_share = participant_sign(
-        &nonce_map.get(id1).unwrap(),
-        &signing_package,
-        &keys.0.get(id1).unwrap().to_owned().try_into().unwrap(),
-    )
-    .unwrap();
-    signature_shares.insert(id1.clone(), signature_share);
-
-    // Singer 2 sign
-    let signature_share = participant_sign(
-        &nonce_map.get(id2).unwrap(),
-        &signing_package,
-        &keys.0.get(id2).unwrap().to_owned().try_into().unwrap(),
-    )
-    .unwrap();
-    signature_shares.insert(id2.clone(), signature_share);
-
-    println!("signing package {:?}", signing_package);
-    let group_signature =
-        frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
-
-    println!("group_signature: {:?}", group_signature);
-
-    // Verify
-    let is_signature_valid = pk_package
-        .verifying_key()
-        .verify(sig_target, &group_signature);
-
-    println!("is_signature_valid: {:?}", is_signature_valid);
-
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
