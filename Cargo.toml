@@ -1,0 +1,17 @@
+[package]
+name = "frost-playground"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+bitcoin = "0.32.3"
+bitcoin_hashes = "0.14.0"
+bitcoincore-rpc = "0.19.0"
+# frost-secp256k1-tr = { version = "1.0.0-rc.0", features = ["serde"], path = "../frost/frost-secp256k1-tr"  }
+frost-secp256k1-tr = { features = ["serde"], git = "https://github.com/conduition/frost", branch = "add-secp256k1-tr" }
+miniscript = "12.2.0"
+
+rand = "0.8.5"
