@@ -175,12 +175,7 @@ fn do_signing(
     nonce_map.insert(id2.clone(), nonces);
 
     // Signing round 2
-    let mut psbt = psbt_to_sign(
-        outpoint,
-        txout,
-        amount_to_send,
-        bitcoind_client,
-    )?;
+    let mut psbt = psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client)?;
     let sighash = calculate_sighash(&psbt, 0)?;
 
     let sig_target = frost::SigningTarget::new(
@@ -216,15 +211,38 @@ fn do_signing(
         frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
 
     println!("group_signature: {:?}", group_signature);
-     // Verify
-     let is_signature_valid = pk_package
-     .verifying_key()
-     .verify(sig_target, &group_signature);
+    // Verify
+    let is_signature_valid = pk_package
+        .verifying_key()
+        .verify(sig_target, &group_signature);
 
     println!("is_signature_valid: {:?}", is_signature_valid);
     assert!(is_signature_valid.is_ok());
 
     Ok((group_signature, psbt))
+}
+
+fn generate_script() -> bitcoin::ScriptBuf {
+    // really dumb script that expect 1 on witness stack
+    let script = bitcoin::Script::builder()
+        .push_int(1)
+        .push_opcode(bitcoin::opcodes::all::OP_EQUAL)
+        .into_script();
+
+    script
+}
+
+fn generate_taproot_spend_info(
+    secp: &bitcoin::secp256k1::Secp256k1<impl bitcoin::secp256k1::Verification>,
+    pk: &bitcoin::secp256k1::PublicKey,
+) -> bitcoin::taproot::TaprootSpendInfo {
+    let builder = bitcoin::taproot::TaprootBuilder::new()
+        .add_leaf(0u8, generate_script())
+        .expect("Couldn't add timelock leaf");
+
+    let finalized_taproot = builder.finalize(&secp, pk.x_only_public_key().0).unwrap();
+
+    finalized_taproot
 }
 
 /* TESTS */
@@ -327,6 +345,131 @@ fn test_key_spend_with_trusted_setup(
     Ok(())
 }
 
+fn test_script_path_spend_with_trusted_setup(
+    bitcoind_client: &impl bitcoincore_rpc::RpcApi,
+) -> Result<(), anyhow::Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let bitcoind_wallet_address = bitcoind_client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+
+    let keys = dealer().unwrap();
+    let pk_package = keys.1;
+    let taproot_spend_info =
+        generate_taproot_spend_info(&secp, &pk_package.verifying_key().to_secp_pk().unwrap());
+
+    let script = generate_script();
+    let control_block = taproot_spend_info
+        .control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))
+        .expect("valid tapscript buf and leaf version");
+
+    let signing_params = frost::SigningParameters {
+        tapscript_merkle_root: Some(
+            taproot_spend_info
+                .merkle_root()
+                .expect("should have merkle root")
+                .to_byte_array()
+                .to_vec(),
+        ),
+    };
+    // This should be a x-only taptweaked key
+    let effective_key = pk_package
+        .verifying_key()
+        .effective_key(&signing_params)
+        .to_secp_pk()
+        .unwrap();
+    let key_spend_address = bitcoin::Address::p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+            effective_key.x_only_public_key().0,
+        ),
+        bitcoin::KnownHrp::Regtest,
+    );
+    println!("Key spend address: {}", key_spend_address);
+
+    let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
+    let txid = bitcoind_client
+        .send_to_address(
+            &key_spend_address,
+            amount_to_recieve,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("valid send");
+    // Lets confirm it
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+
+    let tx = bitcoind_client
+        .get_transaction(&txid, None)
+        .unwrap()
+        .transaction()
+        .expect("get transaction");
+    let vout = tx
+        .output
+        .iter()
+        .position(|v| v.script_pubkey == key_spend_address.script_pubkey())
+        .unwrap();
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+
+    // Signing is irrelevant here since we are not spending with the key spend
+    let (group_signature, mut psbt) = do_signing(
+        &keys.0,
+        &pk_package,
+        outpoint,
+        bitcoind_client,
+        bitcoin::TxOut {
+            value: amount_to_recieve,
+            script_pubkey: key_spend_address.script_pubkey(),
+        },
+        bitcoin::Amount::from_sat(10_000),
+    )?;
+    let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
+        &group_signature.serialize().expect("to serialize"),
+    )
+    .expect("generate secp signature");
+
+    let hash_ty = bitcoin::sighash::TapSighashType::All;
+    let sighash_type = bitcoin::psbt::PsbtSighashType::from(hash_ty);
+    psbt.inputs[0].sighash_type = Some(sighash_type);
+    psbt.inputs[0].tap_merkle_root = taproot_spend_info.merkle_root();
+    let mut tap_scripts = BTreeMap::new();
+    tap_scripts.insert(
+        control_block.clone(),
+        (script.clone(), bitcoin::taproot::LeafVersion::TapScript),
+    );
+    psbt.inputs[0].tap_scripts = tap_scripts;
+
+    let spending_script = bitcoin::Script::builder()
+        .push_int(1)
+        .into_script();
+    let wit = bitcoin::Witness::from(vec![
+        vec![1],
+        script.to_bytes(),
+        control_block.serialize(),
+    ]);
+    psbt.inputs[0].final_script_witness = Some(wit);
+    let tx = psbt.extract_tx().expect("to extract tx");
+
+    println!("tx: {:?}", tx);
+    println!("txid: {:?}", tx.compute_txid());
+
+    bitcoind_client.send_raw_transaction(&tx.clone()).unwrap();
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+
+    Ok(())
+}
+
 fn main() -> Result<(), anyhow::Error> {
     /* Test Setup */
     let bitcoind_client = connect_to_bitcoind();
@@ -356,5 +499,10 @@ fn main() -> Result<(), anyhow::Error> {
     /* TEST 1: Keyspend path with trusted setup */
     test_key_spend_with_trusted_setup(&bitcoind_client)?;
 
+    /* TEST 2: Script path with trusted setup */
+    test_script_path_spend_with_trusted_setup(&bitcoind_client)?;
+
+
+    println!("all tests successful!");
     Ok(())
 }
