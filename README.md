@@ -6,12 +6,10 @@ I will eventually be making custom changes to the taproot crate to include addit
 
 ## Tests so far:
 
-- [ ] Key Spend with Trusted Dealer Setup
-- [ ] Script Spend with Trusted Dealer Setup
-
-TODO:
-- [ ] Key Spend with DKG setup
-- [ ] Script Spend with DKG setup
+- [X] Key Spend with Trusted Dealer Setup
+- [X] Script Spend with Trusted Dealer Setup
+- [X] Key Spend with DKG Setup
+- [X] Script Spend with DKG Setup
 
 ## Setup
 
