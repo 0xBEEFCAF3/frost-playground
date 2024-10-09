@@ -2,12 +2,12 @@ use anyhow::Ok;
 use bitcoin_hashes::Hash;
 use bitcoincore_rpc::RpcApi;
 use frost::{
-    keys::{KeyPackage, PublicKeyPackage, SecretShare},
+    keys::{KeyPackage, PublicKeyPackage},
     round1::{SigningCommitments, SigningNonces},
     round2::SignatureShare,
     Identifier, SigningPackage,
 };
-use frost_secp256k1_tr::{self as frost, keys::SigningShare};
+use frost_secp256k1_tr::{self as frost};
 use rand::thread_rng;
 use std::collections::BTreeMap;
 
@@ -82,10 +82,10 @@ fn dkg() -> anyhow::Result<
     let (key_package_p1, pubkey_package_p1) =
         frost::keys::dkg::part3(&p1_round2_secret_package, &round1_for_p1, &round2_for_p1)?;
 
-    let (key_package_p2, pubkey_package_p2) =
+    let (key_package_p2, _pubkey_package_p2) =
         frost::keys::dkg::part3(&p2_round2_secret_package, &round1_for_p2, &round2_for_p2)?;
 
-    let (key_package_p3, pubkey_package_p3) =
+    let (key_package_p3, _pubkey_package_p3) =
         frost::keys::dkg::part3(&p3_round2_secret_package, &round1_for_p3, &round2_for_p3)?;
 
     let mut keys = BTreeMap::new();
