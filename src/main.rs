@@ -25,32 +25,77 @@ pub trait VerifyingKeyExt: Into<frost::VerifyingKey> {
 
 impl VerifyingKeyExt for frost::VerifyingKey {}
 
-fn dkg() -> anyhow::Result<(), anyhow::Error> {
-    todo!("Implement DKG");
-    // let mut rng = thread_rng();
+fn dkg() -> anyhow::Result<
+    (
+        BTreeMap<Identifier, frost::keys::KeyPackage>,
+        frost::keys::PublicKeyPackage,
+    ),
+    anyhow::Error,
+> {
+    let mut rng = thread_rng();
 
-    // let max_signers = 5;
-    // let min_signers = 3;
+    let id1 = Identifier::try_from(1u16)?;
+    let id2 = Identifier::try_from(2u16)?;
+    let id3 = Identifier::try_from(3u16)?;
 
-    // // Ask the user which identifier they would like to use. You can create
-    // // an identifier from a non-zero u16 or derive from an arbitrary string.
-    // // Some fixed examples follow (each participant must choose a different identifier)
-    // let participant_identifier = Identifier::try_from(7u16)?;
+    // Round1
+    let mut round1_for_p1 = BTreeMap::new();
+    let mut round1_for_p2 = BTreeMap::new();
+    let mut round1_for_p3 = BTreeMap::new();
+    let (p1_round1_secret_package, p1_round1_package) =
+        frost::keys::dkg::part1(id1, MAX_SIGNERS, MIN_SIGNERS, &mut rng)?;
+    let (p2_round1_secret_package, p2_round1_package) =
+        frost::keys::dkg::part1(id2, MAX_SIGNERS, MIN_SIGNERS, &mut rng)?;
+    let (p3_round1_secret_package, p3_round1_package) =
+        frost::keys::dkg::part1(id3, MAX_SIGNERS, MIN_SIGNERS, &mut rng)?;
 
-    // let (round1_secret_package, round1_package) =
-    //     frost::keys::dkg::part1(participant_identifier, max_signers, min_signers, &mut rng)?;
+    round1_for_p1.insert(id2, p2_round1_package.clone());
+    round1_for_p1.insert(id3, p3_round1_package.clone());
 
-    // let mut ids = HashMap::new();
-    // ids.insert(participant_identifier, round1_package);
-    // let (round2_secret_package, round2_packages) =
-    //     frost::keys::dkg::part2(round1_secret_package, &ids)?;
+    round1_for_p2.insert(id1, p1_round1_package.clone());
+    round1_for_p2.insert(id3, p3_round1_package.clone());
 
-    // let (key_package, pubkey_package) =
-    //     frost::keys::dkg::part3(&round2_secret_package, &ids, &round2_packages)?;
+    round1_for_p3.insert(id1, p1_round1_package.clone());
+    round1_for_p3.insert(id2, p2_round1_package.clone());
 
-    // println!("key_package: {:?}", key_package);
-    // println!("pubkey_package: {:?}", pubkey_package);
-    Ok(())
+    let mut round2_for_p1 = BTreeMap::new();
+    let mut round2_for_p2 = BTreeMap::new();
+    let mut round2_for_p3 = BTreeMap::new();
+    let (p1_round2_secret_package, p1_round2_packages) =
+        frost::keys::dkg::part2(p1_round1_secret_package, &round1_for_p1)?;
+
+    let (p2_round2_secret_package, p2_round2_packages) =
+        frost::keys::dkg::part2(p2_round1_secret_package, &round1_for_p2)?;
+
+    let (p3_round2_secret_package, p3_round2_packages) =
+        frost::keys::dkg::part2(p3_round1_secret_package, &round1_for_p3)?;
+
+    round2_for_p1.insert(id2, p2_round2_packages.get(&id1).unwrap().clone());
+    round2_for_p1.insert(id3, p3_round2_packages.get(&id1).unwrap().clone());
+
+    round2_for_p2.insert(id1, p1_round2_packages.get(&id2).unwrap().clone());
+    round2_for_p2.insert(id3, p3_round2_packages.get(&id2).unwrap().clone());
+
+    round2_for_p3.insert(id1, p1_round2_packages.get(&id3).unwrap().clone());
+    round2_for_p3.insert(id2, p2_round2_packages.get(&id3).unwrap().clone());
+
+    let (key_package_p1, pubkey_package_p1) =
+        frost::keys::dkg::part3(&p1_round2_secret_package, &round1_for_p1, &round2_for_p1)?;
+
+    let (key_package_p2, pubkey_package_p2) =
+        frost::keys::dkg::part3(&p2_round2_secret_package, &round1_for_p2, &round2_for_p2)?;
+
+    let (key_package_p3, pubkey_package_p3) =
+        frost::keys::dkg::part3(&p3_round2_secret_package, &round1_for_p3, &round2_for_p3)?;
+
+    let mut keys = BTreeMap::new();
+    keys.insert(id1, key_package_p1);
+    keys.insert(id2, key_package_p2);
+    keys.insert(id3, key_package_p3);
+
+    // All the pubkey packages should be the same
+    // Doesn't matter which one we use
+    Ok((keys, pubkey_package_p1))
 }
 
 fn dealer() -> anyhow::Result<(BTreeMap<Identifier, SecretShare>, PublicKeyPackage), anyhow::Error>
@@ -157,9 +202,8 @@ fn do_signing(
     pk_package: &PublicKeyPackage,
     outpoint: bitcoin::OutPoint,
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
-    txout: bitcoin::TxOut,
-    amount_to_send: bitcoin::Amount,
-) -> Result<(frost::Signature, bitcoin::psbt::Psbt), anyhow::Error> {
+    psbt: &bitcoin::psbt::Psbt,
+) -> Result<frost::Signature, anyhow::Error> {
     // Round 1
     let id1 = &Identifier::try_from(1u16).expect("valid identifier");
     let id2 = &Identifier::try_from(2u16).expect("valid identifier");
@@ -175,8 +219,7 @@ fn do_signing(
     nonce_map.insert(id2.clone(), nonces);
 
     // Signing round 2
-    let mut psbt = psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client)?;
-    let sighash = calculate_sighash(&psbt, 0)?;
+    let sighash = calculate_sighash(psbt, 0)?;
 
     let sig_target = frost::SigningTarget::new(
         sighash.to_raw_hash().to_byte_array().as_slice(),
@@ -219,7 +262,7 @@ fn do_signing(
     println!("is_signature_valid: {:?}", is_signature_valid);
     assert!(is_signature_valid.is_ok());
 
-    Ok((group_signature, psbt))
+    Ok(group_signature)
 }
 
 fn generate_script() -> bitcoin::ScriptBuf {
@@ -305,17 +348,16 @@ fn test_key_spend_with_trusted_setup(
         txid,
         vout: vout as u32,
     };
-    let (group_signature, mut psbt) = do_signing(
-        &keys.0,
-        &pk_package,
-        outpoint,
-        bitcoind_client,
-        bitcoin::TxOut {
-            value: amount_to_recieve,
-            script_pubkey: key_spend_address.script_pubkey(),
-        },
-        bitcoin::Amount::from_sat(10_000),
-    )?;
+    let txout = bitcoin::TxOut {
+        value: amount_to_recieve,
+        script_pubkey: key_spend_address.script_pubkey(),
+    };
+    let amount_to_send = bitcoin::Amount::from_sat(10_000);
+    let mut psbt =
+        psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
+
+    let group_signature =
+        do_signing(&keys.0, &pk_package, outpoint, bitcoind_client, &psbt)?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -347,15 +389,14 @@ fn test_key_spend_with_trusted_setup(
 
 fn test_script_path_spend_with_trusted_setup(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
+    // keys: &BTreeMap<Identifier, SecretShare>,
+    pk_package: &frost::keys::PublicKeyPackage,
 ) -> Result<(), anyhow::Error> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let bitcoind_wallet_address = bitcoind_client
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-
-    let keys = dealer().unwrap();
-    let pk_package = keys.1;
     let taproot_spend_info =
         generate_taproot_spend_info(&secp, &pk_package.verifying_key().to_secp_pk().unwrap());
 
@@ -379,18 +420,18 @@ fn test_script_path_spend_with_trusted_setup(
         .effective_key(&signing_params)
         .to_secp_pk()
         .unwrap();
-    let key_spend_address = bitcoin::Address::p2tr_tweaked(
+    let script_path_spend_address = bitcoin::Address::p2tr_tweaked(
         bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
             effective_key.x_only_public_key().0,
         ),
         bitcoin::KnownHrp::Regtest,
     );
-    println!("Key spend address: {}", key_spend_address);
+    println!("Key spend address: {}", script_path_spend_address);
 
     let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
         .send_to_address(
-            &key_spend_address,
+            &script_path_spend_address,
             amount_to_recieve,
             None,
             None,
@@ -413,29 +454,19 @@ fn test_script_path_spend_with_trusted_setup(
     let vout = tx
         .output
         .iter()
-        .position(|v| v.script_pubkey == key_spend_address.script_pubkey())
+        .position(|v| v.script_pubkey == script_path_spend_address.script_pubkey())
         .unwrap();
     let outpoint = bitcoin::OutPoint {
         txid,
         vout: vout as u32,
     };
-
-    // Signing is irrelevant here since we are not spending with the key spend
-    let (group_signature, mut psbt) = do_signing(
-        &keys.0,
-        &pk_package,
-        outpoint,
-        bitcoind_client,
-        bitcoin::TxOut {
-            value: amount_to_recieve,
-            script_pubkey: key_spend_address.script_pubkey(),
-        },
-        bitcoin::Amount::from_sat(10_000),
-    )?;
-    let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
-        &group_signature.serialize().expect("to serialize"),
-    )
-    .expect("generate secp signature");
+    let txout = bitcoin::TxOut {
+        value: amount_to_recieve,
+        script_pubkey: script_path_spend_address.script_pubkey(),
+    };
+    let amount_to_send = bitcoin::Amount::from_sat(10_000);
+    let mut psbt =
+        psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
     let hash_ty = bitcoin::sighash::TapSighashType::All;
     let sighash_type = bitcoin::psbt::PsbtSighashType::from(hash_ty);
@@ -448,14 +479,7 @@ fn test_script_path_spend_with_trusted_setup(
     );
     psbt.inputs[0].tap_scripts = tap_scripts;
 
-    let spending_script = bitcoin::Script::builder()
-        .push_int(1)
-        .into_script();
-    let wit = bitcoin::Witness::from(vec![
-        vec![1],
-        script.to_bytes(),
-        control_block.serialize(),
-    ]);
+    let wit = bitcoin::Witness::from(vec![vec![1], script.to_bytes(), control_block.serialize()]);
     psbt.inputs[0].final_script_witness = Some(wit);
     let tx = psbt.extract_tx().expect("to extract tx");
 
@@ -496,12 +520,18 @@ fn main() -> Result<(), anyhow::Error> {
     bitcoind_client
         .generate_to_address(202, &bitcoind_wallet_address)
         .unwrap();
+
+    let (mut keys, pk_package) = dkg().unwrap();
     /* TEST 1: Keyspend path with trusted setup */
-    test_key_spend_with_trusted_setup(&bitcoind_client)?;
+    // test_key_spend_with_trusted_setup(&bitcoind_client)?;
 
-    /* TEST 2: Script path with trusted setup */
-    test_script_path_spend_with_trusted_setup(&bitcoind_client)?;
+    // /* TEST 2: Script path with trusted setup */
+    let mut signing_shares = BTreeMap::new();
+    for (_, v) in keys.iter_mut() {
+        signing_shares.insert(v.identifier().clone(), v.clone());
+    }
 
+    test_script_path_spend_with_trusted_setup(&bitcoind_client, &pk_package)?;
 
     println!("all tests successful!");
     Ok(())
