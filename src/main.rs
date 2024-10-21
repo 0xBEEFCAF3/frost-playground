@@ -290,7 +290,7 @@ fn generate_taproot_spend_info(
 }
 
 /* TESTS */
-fn test_key_spend_with_trusted_setup(
+fn test_key_spend(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
@@ -388,7 +388,7 @@ fn test_key_spend_with_trusted_setup(
     Ok(())
 }
 
-fn test_script_path_spend_with_trusted_setup(
+fn test_script_path_spend(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
     pk_package: &frost::keys::PublicKeyPackage,
 ) -> Result<(), anyhow::Error> {
@@ -524,22 +524,22 @@ fn main() -> Result<(), anyhow::Error> {
 
     /* TEST 1: Keyspend path with trusted setup */
     println!("TEST 1: Keyspend path with trusted setup");
-    test_key_spend_with_trusted_setup(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
+    test_key_spend(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
     println!("TEST 1: Keyspend path with trusted setup successfu \n\n");
 
     /* TEST 2: Script path with trusted setup */
     println!("TEST 2: Script path with trusted setup");
-    test_script_path_spend_with_trusted_setup(&bitcoind_client, &dealer_pk_package)?;
+    test_script_path_spend(&bitcoind_client, &dealer_pk_package)?;
     println!("TEST 2: Script path with trusted setup successful \n\n");
 
     /* TEST 3: Keyspend path with dkg setup */
     println!("TEST 3: Keyspend path with dkg setup");
-    test_key_spend_with_trusted_setup(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
+    test_key_spend(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
     println!("TEST 3: Keyspend path with dkg setup successful \n\n");
 
     /* TEST 4: Script path with dkg setup */
     println!("TEST 4: Script path with dkg setup");
-    test_script_path_spend_with_trusted_setup(&bitcoind_client, &dkg_pk_package)?;
+    test_script_path_spend(&bitcoind_client, &dkg_pk_package)?;
     println!("TEST 4: Script path with dkg setup successful \n\n");
 
     println!("all tests successful!");
