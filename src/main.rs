@@ -1,4 +1,5 @@
 use anyhow::Ok;
+use bitcoin::key::TapTweak;
 use bitcoin_hashes::Hash;
 use bitcoincore_rpc::RpcApi;
 use frost::{
@@ -256,7 +257,6 @@ fn do_signing(
     let group_signature =
         frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
 
-    
     // Verify
     let is_signature_valid = pk_package
         .verifying_key()
@@ -284,7 +284,7 @@ fn generate_taproot_spend_info(
 ) -> bitcoin::taproot::TaprootSpendInfo {
     let builder = bitcoin::taproot::TaprootBuilder::new()
         .add_leaf(0u8, generate_script())
-        .expect("Couldn't add timelock leaf");
+        .expect("Couldn't add leaf");
 
     let finalized_taproot = builder.finalize(&secp, pk.x_only_public_key().0).unwrap();
 
@@ -292,10 +292,11 @@ fn generate_taproot_spend_info(
 }
 
 /* TESTS */
-fn test_key_spend_with_trusted_setup(
+fn test_key_spend(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
+    additional_tweak: Option<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let bitcoind_wallet_address = bitcoind_client
         .get_new_address(None, None)
@@ -304,7 +305,7 @@ fn test_key_spend_with_trusted_setup(
 
     let signing_params = frost::SigningParameters {
         tapscript_merkle_root: None,
-        additional_tweak: None,
+        additional_tweak: additional_tweak.clone(),
     };
     // This should be a x-only taptweaked key
     let effective_key = pk_package
@@ -360,7 +361,7 @@ fn test_key_spend_with_trusted_setup(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt, None)?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, additional_tweak.clone())?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -391,133 +392,35 @@ fn test_key_spend_with_trusted_setup(
     Ok(())
 }
 
-fn test_key_spend_with_trusted_setup_and_additional_tweak(
-    bitcoind_client: &impl bitcoincore_rpc::RpcApi,
-    keys: &BTreeMap<Identifier, KeyPackage>,
-    pk_package: &PublicKeyPackage,
-    additional_tweak: &[u8],
-) -> Result<(), anyhow::Error> {
-    let bitcoind_wallet_address = bitcoind_client
-        .get_new_address(None, None)
-        .unwrap()
-        .assume_checked();
-
-    let signing_params = frost::SigningParameters {
-        tapscript_merkle_root: None,
-        additional_tweak: Some(additional_tweak.to_vec()),
-    };
-    // This should be a x-only taptweaked key
-    let effective_key = pk_package
-        .verifying_key()
-        .effective_key(&signing_params)
-        .to_secp_pk()
-        .unwrap();
-    let key_spend_address = bitcoin::Address::p2tr_tweaked(
-        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
-            effective_key.x_only_public_key().0,
-        ),
-        bitcoin::KnownHrp::Regtest,
-    );
-    println!("Key spend address: {}", key_spend_address);
-
-    let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
-    let txid = bitcoind_client
-        .send_to_address(
-            &key_spend_address,
-            amount_to_recieve,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("valid send");
-    // Lets confirm it
-    bitcoind_client
-        .generate_to_address(1, &bitcoind_wallet_address)
-        .unwrap();
-    println!("key spend txid: {}", txid);
-    let tx = bitcoind_client
-        .get_transaction(&txid, None)
-        .unwrap()
-        .transaction()
-        .expect("get transaction");
-    let vout = tx
-        .output
-        .iter()
-        .position(|v| v.script_pubkey == key_spend_address.script_pubkey())
-        .unwrap();
-    let outpoint = bitcoin::OutPoint {
-        txid,
-        vout: vout as u32,
-    };
-    let txout = bitcoin::TxOut {
-        value: amount_to_recieve,
-        script_pubkey: key_spend_address.script_pubkey(),
-    };
-    let amount_to_send = bitcoin::Amount::from_sat(10_000);
-    let mut psbt =
-        psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
-
-    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(additional_tweak.to_vec()))?;
-    let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
-        &group_signature.serialize().expect("to serialize"),
-    )
-    .expect("generate secp signature");
-
-    let hash_ty = bitcoin::sighash::TapSighashType::All;
-    let sighash_type = bitcoin::psbt::PsbtSighashType::from(hash_ty);
-    psbt.inputs[0].sighash_type = Some(sighash_type);
-    psbt.inputs[0].tap_key_sig = Some(bitcoin::taproot::Signature {
-        signature: secp_sig,
-        sighash_type: hash_ty,
-    });
-
-    miniscript::psbt::PsbtExt::finalize_mut(&mut psbt, &bitcoin::secp256k1::Secp256k1::new())
-        .expect("to finalize");
-
-    let tx = psbt.extract_tx().expect("to extract tx");
-
-    println!("key spend txid: {:?}", tx.compute_txid());
-
-    bitcoind_client
-        .send_raw_transaction(&tx.clone())
-        .expect("Successfull broadcast");
-    bitcoind_client
-        .generate_to_address(1, &bitcoind_wallet_address)
-        .unwrap();
-
-    Ok(())
-}
-
-
-fn test_script_path_spend_with_trusted_setup(
+fn test_script_path(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
     pk_package: &frost::keys::PublicKeyPackage,
+    additional_tweak: Option<Vec<u8>>,
 ) -> Result<(), anyhow::Error> {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let bitcoind_wallet_address = bitcoind_client
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    let taproot_spend_info =
-        generate_taproot_spend_info(&secp, &pk_package.verifying_key().to_secp_pk().unwrap());
+
+    let verifying_key = pk_package.verifying_key();
+    let internal_key = frost::tweaked_internal_key(&verifying_key, additional_tweak.clone())
+        .to_secp_pk()
+        .unwrap();
+
+    let taproot_spend_info = generate_taproot_spend_info(&secp, &internal_key);
 
     let script = generate_script();
     let control_block = taproot_spend_info
         .control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))
         .expect("valid tapscript buf and leaf version");
+    let merkle_root = taproot_spend_info
+        .merkle_root()
+        .expect("should have merkle root");
 
     let signing_params = frost::SigningParameters {
-        tapscript_merkle_root: Some(
-            taproot_spend_info
-                .merkle_root()
-                .expect("should have merkle root")
-                .to_byte_array()
-                .to_vec(),
-        ),
-        additional_tweak: None,
+        tapscript_merkle_root: Some(merkle_root.to_byte_array().to_vec()),
+        additional_tweak: additional_tweak.clone(),
     };
     // This should be a x-only taptweaked key
     let effective_key = pk_package
@@ -525,10 +428,20 @@ fn test_script_path_spend_with_trusted_setup(
         .effective_key(&signing_params)
         .to_secp_pk()
         .unwrap();
+
+    // just for debug lets tap tweak the internal key and see if it matches the calculation from the frost lib
+    let tweaked_internal_key = internal_key
+        .x_only_public_key()
+        .0
+        .tap_tweak(&secp, Some(merkle_root));
+    println!("tweaked_internal_key: {:?}", tweaked_internal_key);
+    // assert!(tweaked_internal_key == effective_key.x_only_public_key().0);
+
     let script_path_spend_address = bitcoin::Address::p2tr_tweaked(
-        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
-            effective_key.x_only_public_key().0,
-        ),
+        // bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+        //     tweaked_internal_key,
+        // ),
+        tweaked_internal_key.0,
         bitcoin::KnownHrp::Regtest,
     );
     println!("Key spend address: {}", script_path_spend_address);
@@ -589,7 +502,9 @@ fn test_script_path_spend_with_trusted_setup(
     let tx = psbt.extract_tx().expect("to extract tx");
     println!("script path spend txid: {:?}", tx.compute_txid());
 
-    bitcoind_client.send_raw_transaction(&tx.clone()).expect("Successfull broadcast");
+    bitcoind_client
+        .send_raw_transaction(&tx.clone())
+        .expect("Successfull broadcast");
     bitcoind_client
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
@@ -630,30 +545,66 @@ fn main() -> Result<(), anyhow::Error> {
 
     /* TEST 1: Keyspend path with trusted setup */
     println!("TEST 1: Keyspend path with trusted setup");
-    test_key_spend_with_trusted_setup(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
+    test_key_spend(&bitcoind_client, &dealer_keys, &dealer_pk_package, None)?;
     println!("TEST 1: Keyspend path with trusted setup successfu \n\n");
 
     /* TEST 2: Script path with trusted setup */
     println!("TEST 2: Script path with trusted setup");
-    test_script_path_spend_with_trusted_setup(&bitcoind_client, &dealer_pk_package)?;
+    test_script_path(&bitcoind_client, &dealer_pk_package, None)?;
     println!("TEST 2: Script path with trusted setup successful \n\n");
 
     /* TEST 3: Keyspend path with dkg setup */
     println!("TEST 3: Keyspend path with dkg setup");
-    test_key_spend_with_trusted_setup(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
+    test_key_spend(&bitcoind_client, &dkg_keys, &dkg_pk_package, None)?;
     println!("TEST 3: Keyspend path with dkg setup successful \n\n");
 
     /* TEST 4: Script path with dkg setup */
     println!("TEST 4: Script path with dkg setup");
-    test_script_path_spend_with_trusted_setup(&bitcoind_client, &dkg_pk_package)?;
+    test_script_path(&bitcoind_client, &dkg_pk_package, None)?;
     println!("TEST 4: Script path with dkg setup successful \n\n");
 
-    /* TEST 5: Keyspend path with dkg setup and additional tweak */
-    println!("TEST 5: Keyspend path with dkg setup and additional tweak");
-    // let mut additional_tweak: [u8; 20] = [0; 20];
-    // rand.fill_bytes(&mut additional_tweak);
-    // test_key_spend_with_trusted_setup_and_additional_tweak(&bitcoind_client, &dkg_keys, &dkg_pk_package, &additional_tweak)?;
-    println!("TEST 5: Keyspend path with dkg setup and additional tweak successful \n\n");
+    /* TEST 5: Keyspend path with trusted keys setup and additional tweak */
+    println!("TEST 5: Keyspend path with trusted keys setup and additional tweak");
+    let mut additional_tweak: [u8; 20] = [0; 20];
+    rand.fill_bytes(&mut additional_tweak);
+    test_key_spend(
+        &bitcoind_client,
+        &dealer_keys,
+        &dealer_pk_package,
+        Some(additional_tweak.to_vec()),
+    )?;
+    println!("TEST 5: Keyspend path with trusted keys setup and additional tweak successful \n\n");
+
+    println!("TEST 6: Keyspend path with dkg setup and additional tweak");
+    let mut additional_tweak: [u8; 20] = [0; 20];
+    rand.fill_bytes(&mut additional_tweak);
+    test_key_spend(
+        &bitcoind_client,
+        &dkg_keys,
+        &dkg_pk_package,
+        Some(additional_tweak.to_vec()),
+    )?;
+    println!("TEST 6: Keyspend path with dkg setup and additional tweak successful \n\n");
+
+    println!("TEST 7: Script path with dealer setup and additional tweak");
+    let mut additional_tweak: [u8; 20] = [0; 20];
+    rand.fill_bytes(&mut additional_tweak);
+    test_script_path(
+        &bitcoind_client,
+        &dealer_pk_package,
+        Some(additional_tweak.to_vec()),
+    )?;
+    println!("TEST 7: Script path with dealer setup and additional tweak successful \n\n");
+
+    println!("TEST 8: Script path with dkg setup and additional tweak");
+    let mut additional_tweak: [u8; 20] = [0; 20];
+    rand.fill_bytes(&mut additional_tweak);
+    test_script_path(
+        &bitcoind_client,
+        &dkg_pk_package,
+        Some(additional_tweak.to_vec()),
+    )?;
+    println!("TEST 8: Script path with dkg setup and additional tweak successful \n\n");
 
     println!("all tests successful!");
     Ok(())
