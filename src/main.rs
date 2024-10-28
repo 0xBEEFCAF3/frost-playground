@@ -654,9 +654,13 @@ fn main() -> Result<(), anyhow::Error> {
     test_script_path_spend(&bitcoind_client, &dkg_pk_package)?;
     println!("TEST 4: Script path with dkg setup successful \n\n");
 
-    println!("TEST 5: Keyspend with a tap tweak");
+    println!("TEST 5: Keyspend with a tap tweak with dkg setup");
     test_key_spend_with_tap_tweak(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
-    println!("TEST 5: Keyspend with a tap tweak successful \n\n");
+    println!("TEST 5: Keyspend with a tap tweak with dkg setup successful \n\n");
+
+    println!("TEST 6: Keyspend with a tap tweak with dealer setup");
+    test_key_spend_with_tap_tweak(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
+    println!("TEST 6: Keyspend with a tap tweak with dealer setup successful \n\n");
 
     println!("all tests successful!");
     Ok(())
