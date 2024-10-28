@@ -587,8 +587,7 @@ fn test_key_spend_with_tap_tweak(
     });
     psbt.inputs[0].tap_merkle_root = taproot_spend_info.merkle_root();
 
-    miniscript::psbt::PsbtExt::finalize_mut(&mut psbt, &secp)
-        .expect("to finalize");
+    miniscript::psbt::PsbtExt::finalize_mut(&mut psbt, &secp).expect("to finalize");
 
     let tx = psbt.extract_tx().expect("to extract tx");
 
