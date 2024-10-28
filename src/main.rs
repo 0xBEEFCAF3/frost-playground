@@ -205,6 +205,7 @@ fn do_signing(
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
     psbt: &bitcoin::psbt::Psbt,
+    merkle_root: Option<Vec<u8>>,
 ) -> Result<frost::Signature, anyhow::Error> {
     // Round 1
     let id1 = &Identifier::try_from(1u16).expect("valid identifier");
@@ -226,7 +227,7 @@ fn do_signing(
     let sig_target = frost::SigningTarget::new(
         sighash.to_raw_hash().to_byte_array().as_slice(),
         frost::SigningParameters {
-            tapscript_merkle_root: None,
+            tapscript_merkle_root: merkle_root,
         },
     );
     let signing_package = frost::SigningPackage::new(commitment_map, sig_target.clone());
@@ -254,7 +255,6 @@ fn do_signing(
     let group_signature =
         frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
 
-    
     // Verify
     let is_signature_valid = pk_package
         .verifying_key()
@@ -357,7 +357,7 @@ fn test_key_spend(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt)?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, None)?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -484,7 +484,119 @@ fn test_script_path_spend(
     let tx = psbt.extract_tx().expect("to extract tx");
     println!("script path spend txid: {:?}", tx.compute_txid());
 
-    bitcoind_client.send_raw_transaction(&tx.clone()).expect("Successfull broadcast");
+    bitcoind_client
+        .send_raw_transaction(&tx.clone())
+        .expect("Successfull broadcast");
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+
+    Ok(())
+}
+
+/* TESTS */
+fn test_key_spend_with_tap_tweak(
+    bitcoind_client: &impl bitcoincore_rpc::RpcApi,
+    keys: &BTreeMap<Identifier, KeyPackage>,
+    pk_package: &PublicKeyPackage,
+) -> Result<(), anyhow::Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let bitcoind_wallet_address = bitcoind_client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+
+    let taproot_spend_info =
+        generate_taproot_spend_info(&secp, &pk_package.verifying_key().to_secp_pk().unwrap());
+
+    let merkel_root = taproot_spend_info
+        .merkle_root()
+        .expect("should have merkle root")
+        .to_byte_array()
+        .to_vec();
+
+    let signing_params = frost::SigningParameters {
+        tapscript_merkle_root: Some(merkel_root.clone()),
+    };
+    // This should be a x-only taptweaked key
+    let effective_key = pk_package
+        .verifying_key()
+        .effective_key(&signing_params)
+        .to_secp_pk()
+        .unwrap();
+    let address = bitcoin::Address::p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+            effective_key.x_only_public_key().0,
+        ),
+        bitcoin::KnownHrp::Regtest,
+    );
+    println!("Key spend address: {}", address);
+
+    let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
+    let txid = bitcoind_client
+        .send_to_address(
+            &address,
+            amount_to_recieve,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("valid send");
+    // Lets confirm it
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+    println!("key spend txid: {}", txid);
+    let tx = bitcoind_client
+        .get_transaction(&txid, None)
+        .unwrap()
+        .transaction()
+        .expect("get transaction");
+    let vout = tx
+        .output
+        .iter()
+        .position(|v| v.script_pubkey == address.script_pubkey())
+        .unwrap();
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+    let txout = bitcoin::TxOut {
+        value: amount_to_recieve,
+        script_pubkey: address.script_pubkey(),
+    };
+    let amount_to_send = bitcoin::Amount::from_sat(10_000);
+    let mut psbt =
+        psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
+
+    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(merkel_root))?;
+    let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
+        &group_signature.serialize().expect("to serialize"),
+    )
+    .expect("generate secp signature");
+
+    let hash_ty = bitcoin::sighash::TapSighashType::All;
+    let sighash_type = bitcoin::psbt::PsbtSighashType::from(hash_ty);
+    psbt.inputs[0].sighash_type = Some(sighash_type);
+    psbt.inputs[0].tap_key_sig = Some(bitcoin::taproot::Signature {
+        signature: secp_sig,
+        sighash_type: hash_ty,
+    });
+    psbt.inputs[0].tap_merkle_root = taproot_spend_info.merkle_root();
+
+    miniscript::psbt::PsbtExt::finalize_mut(&mut psbt, &secp)
+        .expect("to finalize");
+
+    let tx = psbt.extract_tx().expect("to extract tx");
+
+    println!("key spend txid: {:?}", tx.compute_txid());
+
+    bitcoind_client
+        .send_raw_transaction(&tx.clone())
+        .expect("Successfull broadcast");
     bitcoind_client
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
@@ -541,6 +653,10 @@ fn main() -> Result<(), anyhow::Error> {
     println!("TEST 4: Script path with dkg setup");
     test_script_path_spend(&bitcoind_client, &dkg_pk_package)?;
     println!("TEST 4: Script path with dkg setup successful \n\n");
+
+    println!("TEST 5: Keyspend with a tap tweak");
+    test_key_spend_with_tap_tweak(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
+    println!("TEST 5: Keyspend with a tap tweak successful \n\n");
 
     println!("all tests successful!");
     Ok(())
