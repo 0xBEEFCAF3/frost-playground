@@ -11,7 +11,7 @@ bitcoin = "0.32.3"
 bitcoin_hashes = "0.14.0"
 bitcoincore-rpc = "0.19.0"
 # frost-secp256k1-tr = { version = "1.0.0-rc.0", features = ["serde"], path = "../frost/frost-secp256k1-tr"  }
-frost-secp256k1-tr = { features = ["serde"], git = "https://github.com/conduition/frost", branch = "add-secp256k1-tr" }
+frost-secp256k1-tr = { features = ["serde"], git = "https://github.com/ZcashFoundation/frost" }
 miniscript = "12.2.0"
 
 rand = "0.8.5"
