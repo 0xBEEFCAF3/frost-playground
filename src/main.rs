@@ -7,7 +7,7 @@ use frost::{
     round2::SignatureShare,
     Identifier, SigningPackage,
 };
-use frost_secp256k1_tr::{self as frost};
+use frost_secp256k1_tr::{self as frost, keys::Tweak};
 use rand::thread_rng;
 use std::collections::BTreeMap;
 
@@ -130,8 +130,17 @@ fn participant_sign(
     nonces: &SigningNonces,
     signing_package: &SigningPackage,
     key_package: &KeyPackage,
+    merkle_root: Option<Vec<u8>>,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
-    let signature_share = frost::round2::sign(&signing_package, nonces, key_package)?;
+    let signature_share = match merkle_root {
+        Some(merkle_root) => frost::round2::sign_with_tweak(
+            &signing_package,
+            nonces,
+            key_package,
+            Some(merkle_root.as_slice()),
+        )?,
+        None => frost::round2::sign(&signing_package, nonces, key_package)?,
+    };
 
     Ok(signature_share)
 }
@@ -222,16 +231,10 @@ fn do_signing(
     nonce_map.insert(id2.clone(), nonces);
 
     // Signing round 2
-    let sighash = calculate_sighash(psbt, 0)?;
+    let sighash = calculate_sighash(psbt, 0)?.to_raw_hash().to_byte_array();
+    let msg = sighash.as_slice();
 
-    let sig_target = frost::SigningTarget::new(
-        sighash.to_raw_hash().to_byte_array().as_slice(),
-        frost::SigningParameters {
-            tapscript_merkle_root: merkle_root,
-        },
-    );
-    let signing_package = frost::SigningPackage::new(commitment_map, sig_target.clone());
-
+    let signing_package = frost::SigningPackage::new(commitment_map, msg);
     let mut signature_shares = BTreeMap::new();
 
     // Singer 1 sign
@@ -239,6 +242,7 @@ fn do_signing(
         &nonce_map.get(id1).unwrap(),
         &signing_package,
         keys.get(id1).unwrap(),
+        merkle_root.clone(),
     )
     .unwrap();
     signature_shares.insert(id1.clone(), signature_share);
@@ -248,20 +252,31 @@ fn do_signing(
         &nonce_map.get(id2).unwrap(),
         &signing_package,
         keys.get(id2).unwrap(),
+        merkle_root.clone(),
     )
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
-    let group_signature =
-        frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap();
+    let group_signature = match merkle_root.clone() {
+        Some(merkle_root) => frost::aggregate_with_tweak(
+            &signing_package,
+            &signature_shares,
+            &pk_package,
+            Some(merkle_root.as_slice()),
+        )
+        .unwrap(),
+        None => frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap(),
+    };
 
     // Verify
-    let is_signature_valid = pk_package
-        .verifying_key()
-        .verify(sig_target, &group_signature);
+    if let Some(merkle_root) = merkle_root.clone() {
+        let public_key_package = pk_package.clone().tweak(Some(merkle_root.as_slice()));
+        let tweaked_key = public_key_package.verifying_key();
+        tweaked_key.verify(msg, &group_signature).unwrap();
 
-    println!("is_signature_valid: {:?}", is_signature_valid);
-    assert!(is_signature_valid.is_ok());
+    } else {
+        pk_package.verifying_key().verify(msg, &group_signature).unwrap();
+    }
 
     Ok(group_signature)
 }
@@ -300,15 +315,9 @@ fn test_key_spend(
         .unwrap()
         .assume_checked();
 
-    let signing_params = frost::SigningParameters {
-        tapscript_merkle_root: None,
-    };
     // This should be a x-only taptweaked key
-    let effective_key = pk_package
-        .verifying_key()
-        .effective_key(&signing_params)
-        .to_secp_pk()
-        .unwrap();
+    // Tap tweaked with the empty merkle root tweak
+    let effective_key = pk_package.verifying_key().to_secp_pk().unwrap();
     let key_spend_address = bitcoin::Address::p2tr_tweaked(
         bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
             effective_key.x_only_public_key().0,
@@ -404,20 +413,16 @@ fn test_script_path_spend(
     let control_block = taproot_spend_info
         .control_block(&(script.clone(), bitcoin::taproot::LeafVersion::TapScript))
         .expect("valid tapscript buf and leaf version");
-
-    let signing_params = frost::SigningParameters {
-        tapscript_merkle_root: Some(
-            taproot_spend_info
-                .merkle_root()
-                .expect("should have merkle root")
-                .to_byte_array()
-                .to_vec(),
-        ),
-    };
+    let merkle_root = taproot_spend_info
+        .merkle_root()
+        .expect("should have merkle root")
+        .to_byte_array()
+        .to_vec();
     // This should be a x-only taptweaked key
     let effective_key = pk_package
+        .clone()
+        .tweak(Some(merkle_root))
         .verifying_key()
-        .effective_key(&signing_params)
         .to_secp_pk()
         .unwrap();
     let script_path_spend_address = bitcoin::Address::p2tr_tweaked(
@@ -515,13 +520,11 @@ fn test_key_spend_with_tap_tweak(
         .to_byte_array()
         .to_vec();
 
-    let signing_params = frost::SigningParameters {
-        tapscript_merkle_root: Some(merkel_root.clone()),
-    };
     // This should be a x-only taptweaked key
     let effective_key = pk_package
+        .clone()
+        .tweak(Some(merkel_root.clone()))
         .verifying_key()
-        .effective_key(&signing_params)
         .to_secp_pk()
         .unwrap();
     let address = bitcoin::Address::p2tr_tweaked(
@@ -636,7 +639,7 @@ fn main() -> Result<(), anyhow::Error> {
     /* TEST 1: Keyspend path with trusted setup */
     println!("TEST 1: Keyspend path with trusted setup");
     test_key_spend(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
-    println!("TEST 1: Keyspend path with trusted setup successfu \n\n");
+    println!("TEST 1: Keyspend path with trusted setup successful \n\n");
 
     /* TEST 2: Script path with trusted setup */
     println!("TEST 2: Script path with trusted setup");
