@@ -7,7 +7,7 @@ use frost::{
     round2::SignatureShare,
     Identifier, SigningPackage,
 };
-use frost_secp256k1_tr::{self as frost, keys::Tweak};
+use frost_secp256k1_tr::{self as frost, keys::Tweak, SigningParameters};
 use rand::thread_rng;
 use std::collections::BTreeMap;
 
@@ -131,12 +131,17 @@ fn participant_sign(
     signing_package: &SigningPackage,
     key_package: &KeyPackage,
     merkle_root: Option<Vec<u8>>,
+    additional_tweak: Option<Vec<u8>>,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
+    let signing_parameters = SigningParameters{
+        tapscript_merkle_root: merkle_root.clone(),
+        additional_tweak: additional_tweak.clone(),
+    };
     let signature_share = frost::round2::sign_with_tweak(
         &signing_package,
         nonces,
         key_package,
-        merkle_root.as_ref().map(|v| &**v),
+        Some(&signing_parameters),
     )?;
 
     Ok(signature_share)
@@ -240,6 +245,7 @@ fn do_signing(
         &signing_package,
         keys.get(id1).unwrap(),
         merkle_root.clone(),
+        None,
     )
     .unwrap();
     signature_shares.insert(id1.clone(), signature_share);
@@ -250,15 +256,24 @@ fn do_signing(
         &signing_package,
         keys.get(id2).unwrap(),
         merkle_root.clone(),
+        None,
     )
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
+
+    // TODO Change later to come from param
+    let additional_tweak = None;
+
+    let signing_parameters = SigningParameters{
+        tapscript_merkle_root: merkle_root.clone(),
+        additional_tweak: additional_tweak.clone(),
+    };
     let group_signature = frost::aggregate_with_tweak(
         &signing_package,
         &signature_shares,
         &pk_package,
-        merkle_root.as_ref().map(|v| &**v),
+        Some(&signing_parameters),
     )
     .unwrap();
 
@@ -429,10 +444,15 @@ fn test_script_path_spend(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
+    let signing_parameters = SigningParameters{
+        tapscript_merkle_root: Some(merkle_root.clone()),
+        additional_tweak: None,
+    };
+        
     // This should be a x-only taptweaked key
     let effective_key = pk_package
         .clone()
-        .tweak(Some(merkle_root))
+        .tweak(&signing_parameters)
         .verifying_key()
         .to_secp_pk()
         .unwrap();
@@ -548,11 +568,15 @@ fn test_key_spend_with_tap_tweak(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
+    let signing_parameters = SigningParameters{
+        tapscript_merkle_root: Some(merkel_root.clone()),
+        additional_tweak: None,
+    };
 
     // This should be a x-only taptweaked key
     let effective_key = pk_package
         .clone()
-        .tweak(Some(merkel_root.clone()))
+        .tweak(&signing_parameters)
         .verifying_key()
         .to_secp_pk()
         .unwrap();
