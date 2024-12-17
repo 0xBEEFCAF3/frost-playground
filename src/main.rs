@@ -130,36 +130,14 @@ fn participant_sign(
     nonces: &SigningNonces,
     signing_package: &SigningPackage,
     key_package: &KeyPackage,
-    signing_parameters: Option<SigningParameters>,
+    signing_parameters: &SigningParameters,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
-<<<<<<< HEAD
-    let signing_parameters = SigningParameters{
-        tapscript_merkle_root: merkle_root.clone(),
-        additional_tweak: additional_tweak.clone(),
-    };
     let signature_share = frost::round2::sign_with_tweak(
         &signing_package,
         nonces,
         key_package,
-        Some(&signing_parameters),
+        Some(signing_parameters),
     )?;
-=======
-
-    let signature_share = {
-        if signing_parameters.is_some() {
-            println!("Signing with tweak");
-            frost::round2::sign_with_tweak(
-                &signing_package,
-                nonces,
-                key_package,
-                signing_parameters.as_ref(),
-            )?
-        } else {
-            frost::round2::sign(&signing_package, nonces, key_package)?
-        }
-    };
->>>>>>> 77b6cbc (sign with additional tweak and merkle root tweak)
-
     Ok(signature_share)
 }
 
@@ -232,7 +210,7 @@ fn do_signing(
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
     psbt: &bitcoin::psbt::Psbt,
-    signing_parameters: Option<SigningParameters>,
+    signing_parameters: &SigningParameters,
 ) -> Result<frost::Signature, anyhow::Error> {
     // Round 1
     let id1 = &Identifier::try_from(1u16).expect("valid identifier");
@@ -260,7 +238,7 @@ fn do_signing(
         &nonce_map.get(id1).unwrap(),
         &signing_package,
         keys.get(id1).unwrap(),
-        signing_parameters.clone(),
+        signing_parameters,
     )
     .unwrap();
     signature_shares.insert(id1.clone(), signature_share);
@@ -270,61 +248,22 @@ fn do_signing(
         &nonce_map.get(id2).unwrap(),
         &signing_package,
         keys.get(id2).unwrap(),
-        signing_parameters.clone(),
+        signing_parameters,
     )
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
-<<<<<<< HEAD
-
-    // TODO Change later to come from param
-    let additional_tweak = None;
-
-    let signing_parameters = SigningParameters{
-        tapscript_merkle_root: merkle_root.clone(),
-        additional_tweak: additional_tweak.clone(),
-    };
     let group_signature = frost::aggregate_with_tweak(
         &signing_package,
         &signature_shares,
         &pk_package,
-        Some(&signing_parameters),
+        Some(signing_parameters),
     )
     .unwrap();
 
-    let tweaked_pk_package = pk_package.clone().tweak(merkle_root.as_ref().map(|v| &**v));
+    let tweaked_pk_package = pk_package.clone().tweak(signing_parameters);
     let effective_key = tweaked_pk_package.verifying_key();
     effective_key.verify(msg, &group_signature).unwrap();
-=======
-
-    let group_signature = {
-        if signing_parameters.is_some() {
-            frost::aggregate_with_tweak(
-                &signing_package,
-                &signature_shares,
-                &pk_package,
-                signing_parameters.as_ref(),
-            )
-            .unwrap()
-        } else {
-            frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap()
-        }
-    };
-
-    // Verify
-    let effective_key = {
-        if let Some(signing_parameters) = signing_parameters {
-            pk_package.clone().tweak(&signing_parameters)
-        } else {
-            pk_package.clone()
-        }
-    };
-
-    effective_key
-        .verifying_key()
-        .verify(msg, &group_signature)
-        .unwrap();
->>>>>>> 77b6cbc (sign with additional tweak and merkle root tweak)
 
     Ok(group_signature)
 }
@@ -366,19 +305,25 @@ fn test_key_spend(
 
     // This should be a x-only taptweaked key
     // Tap tweaked with the empty merkle root tweak
+
+    let signing_parameters = SigningParameters {
+        tapscript_merkle_root: None,
+        additional_tweak: None,
+    };
+
+    let internal_key = pk_package.verifying_key().to_secp_pk().unwrap();
     let effective_key = pk_package
         .clone()
-        .tweak::<&[u8]>(None)
+        .tweak(&signing_parameters)
         .verifying_key()
         .to_secp_pk()
         .unwrap();
-    let internal_key = pk_package.verifying_key().to_secp_pk().unwrap();
-
     assert_ne!(
         effective_key.x_only_public_key().0,
         internal_key.x_only_public_key().0,
         "Effective key should not be the same as internal key"
     );
+
     let key_spend_address = bitcoin::Address::p2tr_tweaked(
         bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
             effective_key.x_only_public_key().0,
@@ -438,7 +383,7 @@ fn test_key_spend(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt, None)?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, &signing_parameters)?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -687,7 +632,7 @@ fn test_key_spend_with_tap_tweak(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(signing_parameters))?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, &signing_parameters)?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -737,7 +682,7 @@ fn test_key_spend_with_additional_tweak(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
-    
+
     // 20 byte random additional tweak
     let mut additional_tweak = [1u8; 20];
     rand::thread_rng()
@@ -804,12 +749,7 @@ fn test_key_spend_with_additional_tweak(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(
-        &keys,
-        &pk_package,
-        &psbt,
-        Some(signing_parameters),
-    )?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, &signing_parameters)?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
