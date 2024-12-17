@@ -132,7 +132,6 @@ fn participant_sign(
     key_package: &KeyPackage,
     signing_parameters: Option<SigningParameters>,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
-
     let signature_share = {
         if signing_parameters.is_some() {
             println!("Signing with tweak");
@@ -262,7 +261,6 @@ fn do_signing(
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
-
     let group_signature = {
         if signing_parameters.is_some() {
             frost::aggregate_with_tweak(
@@ -323,6 +321,7 @@ fn test_key_spend(
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
 ) -> Result<(), anyhow::Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
     let bitcoind_wallet_address = bitcoind_client
         .get_new_address(None, None)
         .unwrap()
@@ -330,14 +329,37 @@ fn test_key_spend(
 
     // This should be a x-only taptweaked key
     // Tap tweaked with the empty merkle root tweak
-    let effective_key = pk_package.verifying_key().to_secp_pk().unwrap();
+    let signing_parameters = SigningParameters {
+        tapscript_merkle_root: None,
+        additional_tweak: None,
+    };
+    let effective_key = pk_package
+        .clone()
+        .tweak(&signing_parameters)
+        .verifying_key()
+        .to_secp_pk()
+        .unwrap();
     let key_spend_address = bitcoin::Address::p2tr_tweaked(
         bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
             effective_key.x_only_public_key().0,
         ),
         bitcoin::KnownHrp::Regtest,
     );
-    println!("Key spend address: {}", key_spend_address);
+
+    // additional test: lets tweak with rust-bitcoin and see if we get the same key
+    let bitcoin_key = pk_package.verifying_key().to_secp_pk().unwrap();
+    let tweaked_address = bitcoin::Address::p2tr(
+        &secp,
+        bitcoin_key.x_only_public_key().0,
+        None,
+        bitcoin::KnownHrp::Regtest,
+    );
+
+    assert_eq!(
+        key_spend_address,
+        tweaked_address,
+        "Tweaked address should be the same when derived using rust-bitcoin"
+    );
 
     let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
@@ -379,7 +401,7 @@ fn test_key_spend(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt, None)?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(signing_parameters))?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -646,7 +668,7 @@ fn test_key_spend_with_additional_tweak(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
-    
+
     // 20 byte random additional tweak
     let mut additional_tweak = [1u8; 20];
     rand::thread_rng()
@@ -713,12 +735,7 @@ fn test_key_spend_with_additional_tweak(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(
-        &keys,
-        &pk_package,
-        &psbt,
-        Some(signing_parameters),
-    )?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(signing_parameters))?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
