@@ -8,7 +8,7 @@ use frost::{
     Identifier, SigningPackage,
 };
 use frost_secp256k1_tr::{self as frost, keys::Tweak, SigningParameters};
-use rand::thread_rng;
+use rand::{thread_rng, RngCore};
 use std::collections::BTreeMap;
 
 const TEST_WALLET_NAME: &str = "frost-playground";
@@ -130,28 +130,21 @@ fn participant_sign(
     nonces: &SigningNonces,
     signing_package: &SigningPackage,
     key_package: &KeyPackage,
-    merkle_root: Option<Vec<u8>>,
-    additional_tweak: Option<Vec<u8>>,
+    signing_parameters: Option<SigningParameters>,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
 
-    let signing_parameters = SigningParameters{
-        tapscript_merkle_root: merkle_root.clone(),
-        additional_tweak: additional_tweak.clone(),
-    };
-    let signature_share = match (merkle_root, additional_tweak) {
-        (Some(_), Some(_additional_tweak)) => frost::round2::sign_with_tweak(
-            &signing_package,
-            nonces,
-            key_package,
-            Some(&signing_parameters),
-        )?,
-        (Some(_merkle_root), None) => frost::round2::sign_with_tweak(
-            &signing_package,
-            nonces,
-            key_package,
-            Some(&signing_parameters),
-        )?,
-        _ => frost::round2::sign(&signing_package, nonces, key_package)?,
+    let signature_share = {
+        if signing_parameters.is_some() {
+            println!("Signing with tweak");
+            frost::round2::sign_with_tweak(
+                &signing_package,
+                nonces,
+                key_package,
+                signing_parameters.as_ref(),
+            )?
+        } else {
+            frost::round2::sign(&signing_package, nonces, key_package)?
+        }
     };
 
     Ok(signature_share)
@@ -226,7 +219,7 @@ fn do_signing(
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
     psbt: &bitcoin::psbt::Psbt,
-    merkle_root: Option<Vec<u8>>,
+    signing_parameters: Option<SigningParameters>,
 ) -> Result<frost::Signature, anyhow::Error> {
     // Round 1
     let id1 = &Identifier::try_from(1u16).expect("valid identifier");
@@ -254,8 +247,7 @@ fn do_signing(
         &nonce_map.get(id1).unwrap(),
         &signing_package,
         keys.get(id1).unwrap(),
-        merkle_root.clone(),
-        None,
+        signing_parameters.clone(),
     )
     .unwrap();
     signature_shares.insert(id1.clone(), signature_share);
@@ -265,26 +257,19 @@ fn do_signing(
         &nonce_map.get(id2).unwrap(),
         &signing_package,
         keys.get(id2).unwrap(),
-        merkle_root.clone(),
-        None,
+        signing_parameters.clone(),
     )
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
-    // TODO Change later to come from param
-    let additional_tweak = None;
 
-    let signing_parameters = SigningParameters{
-        tapscript_merkle_root: merkle_root.clone(),
-        additional_tweak: additional_tweak.clone(),
-    };
     let group_signature = {
-        if merkle_root.is_some() || additional_tweak.is_some() {
+        if signing_parameters.is_some() {
             frost::aggregate_with_tweak(
                 &signing_package,
                 &signature_shares,
                 &pk_package,
-                Some(&signing_parameters),
+                signing_parameters.as_ref(),
             )
             .unwrap()
         } else {
@@ -294,14 +279,17 @@ fn do_signing(
 
     // Verify
     let effective_key = {
-        if merkle_root.is_some() || additional_tweak.is_some() {
+        if let Some(signing_parameters) = signing_parameters {
             pk_package.clone().tweak(&signing_parameters)
         } else {
             pk_package.clone()
         }
     };
 
-    effective_key.verifying_key().verify(msg, &group_signature).unwrap();
+    effective_key
+        .verifying_key()
+        .verify(msg, &group_signature)
+        .unwrap();
 
     Ok(group_signature)
 }
@@ -443,11 +431,11 @@ fn test_script_path_spend(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
-    let signing_parameters = SigningParameters{
+    let signing_parameters = SigningParameters {
         tapscript_merkle_root: Some(merkle_root.clone()),
         additional_tweak: None,
     };
-        
+
     // This should be a x-only taptweaked key
     let effective_key = pk_package
         .clone()
@@ -529,7 +517,6 @@ fn test_script_path_spend(
     Ok(())
 }
 
-/* TESTS */
 fn test_key_spend_with_tap_tweak(
     bitcoind_client: &impl bitcoincore_rpc::RpcApi,
     keys: &BTreeMap<Identifier, KeyPackage>,
@@ -549,7 +536,7 @@ fn test_key_spend_with_tap_tweak(
         .expect("should have merkle root")
         .to_byte_array()
         .to_vec();
-    let signing_parameters = SigningParameters{
+    let signing_parameters = SigningParameters {
         tapscript_merkle_root: Some(merkel_root.clone()),
         additional_tweak: None,
     };
@@ -609,7 +596,129 @@ fn test_key_spend_with_tap_tweak(
     let mut psbt =
         psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
 
-    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(merkel_root))?;
+    let group_signature = do_signing(&keys, &pk_package, &psbt, Some(signing_parameters))?;
+    let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
+        &group_signature.serialize().expect("to serialize"),
+    )
+    .expect("generate secp signature");
+
+    let hash_ty = bitcoin::sighash::TapSighashType::All;
+    let sighash_type = bitcoin::psbt::PsbtSighashType::from(hash_ty);
+    psbt.inputs[0].sighash_type = Some(sighash_type);
+    psbt.inputs[0].tap_key_sig = Some(bitcoin::taproot::Signature {
+        signature: secp_sig,
+        sighash_type: hash_ty,
+    });
+    psbt.inputs[0].tap_merkle_root = taproot_spend_info.merkle_root();
+
+    miniscript::psbt::PsbtExt::finalize_mut(&mut psbt, &secp).expect("to finalize");
+
+    let tx = psbt.extract_tx().expect("to extract tx");
+
+    println!("key spend txid: {:?}", tx.compute_txid());
+
+    bitcoind_client
+        .send_raw_transaction(&tx.clone())
+        .expect("Successfull broadcast");
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+
+    Ok(())
+}
+
+fn test_key_spend_with_additional_tweak(
+    bitcoind_client: &impl bitcoincore_rpc::RpcApi,
+    keys: &BTreeMap<Identifier, KeyPackage>,
+    pk_package: &PublicKeyPackage,
+) -> Result<(), anyhow::Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let bitcoind_wallet_address = bitcoind_client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+
+    let taproot_spend_info =
+        generate_taproot_spend_info(&secp, &pk_package.verifying_key().to_secp_pk().unwrap());
+
+    let merkel_root = taproot_spend_info
+        .merkle_root()
+        .expect("should have merkle root")
+        .to_byte_array()
+        .to_vec();
+    
+    // 20 byte random additional tweak
+    let mut additional_tweak = [1u8; 20];
+    rand::thread_rng()
+        .try_fill_bytes(&mut additional_tweak)
+        .unwrap();
+    let signing_parameters = SigningParameters {
+        tapscript_merkle_root: Some(merkel_root.clone()),
+        additional_tweak: Some(additional_tweak.to_vec()),
+    };
+    println!("signing parameters: {:?}", signing_parameters);
+
+    // This should be a x-only taptweaked key
+    let effective_key = pk_package
+        .clone()
+        .tweak(&signing_parameters)
+        .verifying_key()
+        .to_secp_pk()
+        .unwrap();
+    let address = bitcoin::Address::p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+            effective_key.x_only_public_key().0,
+        ),
+        bitcoin::KnownHrp::Regtest,
+    );
+    println!("Key spend address: {}", address);
+
+    let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
+    let txid = bitcoind_client
+        .send_to_address(
+            &address,
+            amount_to_recieve,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("valid send");
+    // Lets confirm it
+    bitcoind_client
+        .generate_to_address(1, &bitcoind_wallet_address)
+        .unwrap();
+    println!("key spend txid: {}", txid);
+    let tx = bitcoind_client
+        .get_transaction(&txid, None)
+        .unwrap()
+        .transaction()
+        .expect("get transaction");
+    let vout = tx
+        .output
+        .iter()
+        .position(|v| v.script_pubkey == address.script_pubkey())
+        .unwrap();
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+    let txout = bitcoin::TxOut {
+        value: amount_to_recieve,
+        script_pubkey: address.script_pubkey(),
+    };
+    let amount_to_send = bitcoin::Amount::from_sat(10_000);
+    let mut psbt =
+        psbt_to_sign(outpoint, txout, amount_to_send, bitcoind_client).expect("generate psbt");
+
+    let group_signature = do_signing(
+        &keys,
+        &pk_package,
+        &psbt,
+        Some(signing_parameters),
+    )?;
     let secp_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(
         &group_signature.serialize().expect("to serialize"),
     )
@@ -697,6 +806,14 @@ fn main() -> Result<(), anyhow::Error> {
     println!("TEST 6: Keyspend with a tap tweak with dealer setup");
     test_key_spend_with_tap_tweak(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
     println!("TEST 6: Keyspend with a tap tweak with dealer setup successful \n\n");
+
+    println!("TEST 7: Keyspend with an additional tweak with dkg setup");
+    test_key_spend_with_additional_tweak(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
+    println!("TEST 7: Keyspend with an additional tweak with dkg setup successful \n\n");
+
+    println!("TEST 8: Keyspend with an additional tweak with dealer setup");
+    test_key_spend_with_additional_tweak(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
+    println!("TEST 8: Keyspend with an additional tweak with dealer setup successful \n\n");
 
     println!("all tests successful!");
     Ok(())
