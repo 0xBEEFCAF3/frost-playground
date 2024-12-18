@@ -132,15 +132,12 @@ fn participant_sign(
     key_package: &KeyPackage,
     merkle_root: Option<Vec<u8>>,
 ) -> anyhow::Result<SignatureShare, anyhow::Error> {
-    let signature_share = match merkle_root {
-        Some(merkle_root) => frost::round2::sign_with_tweak(
-            &signing_package,
-            nonces,
-            key_package,
-            Some(merkle_root.as_slice()),
-        )?,
-        None => frost::round2::sign(&signing_package, nonces, key_package)?,
-    };
+    let signature_share = frost::round2::sign_with_tweak(
+        &signing_package,
+        nonces,
+        key_package,
+        merkle_root.as_ref().map(|v| &**v),
+    )?;
 
     Ok(signature_share)
 }
@@ -257,26 +254,17 @@ fn do_signing(
     .unwrap();
     signature_shares.insert(id2.clone(), signature_share);
 
-    let group_signature = match merkle_root.clone() {
-        Some(merkle_root) => frost::aggregate_with_tweak(
-            &signing_package,
-            &signature_shares,
-            &pk_package,
-            Some(merkle_root.as_slice()),
-        )
-        .unwrap(),
-        None => frost::aggregate(&signing_package, &signature_shares, &pk_package).unwrap(),
-    };
+    let group_signature = frost::aggregate_with_tweak(
+        &signing_package,
+        &signature_shares,
+        &pk_package,
+        merkle_root.as_ref().map(|v| &**v),
+    )
+    .unwrap();
 
-    // Verify
-    if let Some(merkle_root) = merkle_root.clone() {
-        let public_key_package = pk_package.clone().tweak(Some(merkle_root.as_slice()));
-        let tweaked_key = public_key_package.verifying_key();
-        tweaked_key.verify(msg, &group_signature).unwrap();
-
-    } else {
-        pk_package.verifying_key().verify(msg, &group_signature).unwrap();
-    }
+    let tweaked_pk_package = pk_package.clone().tweak(merkle_root.as_ref().map(|v| &**v));
+    let effective_key = tweaked_pk_package.verifying_key();
+    effective_key.verify(msg, &group_signature).unwrap();
 
     Ok(group_signature)
 }
@@ -310,6 +298,7 @@ fn test_key_spend(
     keys: &BTreeMap<Identifier, KeyPackage>,
     pk_package: &PublicKeyPackage,
 ) -> Result<(), anyhow::Error> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
     let bitcoind_wallet_address = bitcoind_client
         .get_new_address(None, None)
         .unwrap()
@@ -317,7 +306,19 @@ fn test_key_spend(
 
     // This should be a x-only taptweaked key
     // Tap tweaked with the empty merkle root tweak
-    let effective_key = pk_package.verifying_key().to_secp_pk().unwrap();
+    let effective_key = pk_package
+        .clone()
+        .tweak::<&[u8]>(None)
+        .verifying_key()
+        .to_secp_pk()
+        .unwrap();
+    let internal_key = pk_package.verifying_key().to_secp_pk().unwrap();
+
+    assert_ne!(
+        effective_key.x_only_public_key().0,
+        internal_key.x_only_public_key().0,
+        "Effective key should not be the same as internal key"
+    );
     let key_spend_address = bitcoin::Address::p2tr_tweaked(
         bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
             effective_key.x_only_public_key().0,
@@ -325,6 +326,17 @@ fn test_key_spend(
         bitcoin::KnownHrp::Regtest,
     );
     println!("Key spend address: {}", key_spend_address);
+    // additional test: lets tweak with rust-bitcoin and see if we get the same key
+    let p2tr_address = bitcoin::Address::p2tr(
+        &secp,
+        internal_key.x_only_public_key().0,
+        None,
+        bitcoin::KnownHrp::Regtest,
+    );
+    assert_eq!(
+        key_spend_address, p2tr_address,
+        "Tweaked address should be the same when derived using rust-bitcoin"
+    );
 
     let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
@@ -343,7 +355,7 @@ fn test_key_spend(
     bitcoind_client
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
-    println!("key spend txid: {}", txid);
+
     let tx = bitcoind_client
         .get_transaction(&txid, None)
         .unwrap()
@@ -385,8 +397,6 @@ fn test_key_spend(
 
     let tx = psbt.extract_tx().expect("to extract tx");
 
-    println!("key spend txid: {:?}", tx.compute_txid());
-
     bitcoind_client
         .send_raw_transaction(&tx.clone())
         .expect("Successfull broadcast");
@@ -394,6 +404,7 @@ fn test_key_spend(
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
 
+    println!("key spend txid: {:?}", tx.compute_txid());
     Ok(())
 }
 
@@ -431,7 +442,25 @@ fn test_script_path_spend(
         ),
         bitcoin::KnownHrp::Regtest,
     );
-    println!("Key spend address: {}", script_path_spend_address);
+    println!("Script path spend address: {}", script_path_spend_address);
+
+    // additional test: lets tweak with rust-bitcoin and see if we get the same key
+    let internal_key = pk_package.verifying_key().to_secp_pk().unwrap();
+    assert_ne!(
+        internal_key.x_only_public_key().0,
+        effective_key.x_only_public_key().0,
+        "Effective key should not be the same as internal key"
+    );
+    let p2tr_address = bitcoin::Address::p2tr(
+        &secp,
+        internal_key.x_only_public_key().0,
+        taproot_spend_info.merkle_root(),
+        bitcoin::KnownHrp::Regtest,
+    );
+    assert_eq!(
+        script_path_spend_address, p2tr_address,
+        "Tweaked address should be the same when derived using rust-bitcoin"
+    );
 
     let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
@@ -534,6 +563,22 @@ fn test_key_spend_with_tap_tweak(
         bitcoin::KnownHrp::Regtest,
     );
     println!("Key spend address: {}", address);
+    let internal_key = pk_package.verifying_key().to_secp_pk().unwrap();
+    assert_ne!(
+        internal_key.x_only_public_key().0,
+        effective_key.x_only_public_key().0,
+        "Effective key should not be the same as internal key"
+    );
+    let p2tr_address = bitcoin::Address::p2tr(
+        &secp,
+        internal_key.x_only_public_key().0,
+        taproot_spend_info.merkle_root(),
+        bitcoin::KnownHrp::Regtest,
+    );
+    assert_eq!(
+        address, p2tr_address,
+        "Tweaked address should be the same when derived using rust-bitcoin"
+    );
 
     let amount_to_recieve = bitcoin::Amount::from_sat(100_000);
     let txid = bitcoind_client
@@ -552,7 +597,6 @@ fn test_key_spend_with_tap_tweak(
     bitcoind_client
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
-    println!("key spend txid: {}", txid);
     let tx = bitcoind_client
         .get_transaction(&txid, None)
         .unwrap()
@@ -594,8 +638,6 @@ fn test_key_spend_with_tap_tweak(
 
     let tx = psbt.extract_tx().expect("to extract tx");
 
-    println!("key spend txid: {:?}", tx.compute_txid());
-
     bitcoind_client
         .send_raw_transaction(&tx.clone())
         .expect("Successfull broadcast");
@@ -603,6 +645,7 @@ fn test_key_spend_with_tap_tweak(
         .generate_to_address(1, &bitcoind_wallet_address)
         .unwrap();
 
+    println!("key spend txid: {:?}", tx.compute_txid());
     Ok(())
 }
 
@@ -636,22 +679,18 @@ fn main() -> Result<(), anyhow::Error> {
     let (dealer_keys, dealer_pk_package) = dealer().unwrap();
     let (dkg_keys, dkg_pk_package) = dkg().unwrap();
 
-    /* TEST 1: Keyspend path with trusted setup */
     println!("TEST 1: Keyspend path with trusted setup");
     test_key_spend(&bitcoind_client, &dealer_keys, &dealer_pk_package)?;
     println!("TEST 1: Keyspend path with trusted setup successful \n\n");
 
-    /* TEST 2: Script path with trusted setup */
     println!("TEST 2: Script path with trusted setup");
     test_script_path_spend(&bitcoind_client, &dealer_pk_package)?;
     println!("TEST 2: Script path with trusted setup successful \n\n");
 
-    /* TEST 3: Keyspend path with dkg setup */
     println!("TEST 3: Keyspend path with dkg setup");
     test_key_spend(&bitcoind_client, &dkg_keys, &dkg_pk_package)?;
     println!("TEST 3: Keyspend path with dkg setup successful \n\n");
 
-    /* TEST 4: Script path with dkg setup */
     println!("TEST 4: Script path with dkg setup");
     test_script_path_spend(&bitcoind_client, &dkg_pk_package)?;
     println!("TEST 4: Script path with dkg setup successful \n\n");
