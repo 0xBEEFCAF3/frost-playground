@@ -136,7 +136,7 @@ fn participant_sign(
         &signing_package,
         nonces,
         key_package,
-        Some(signing_parameters),
+        signing_parameters,
     )?;
     Ok(signature_share)
 }
@@ -257,7 +257,7 @@ fn do_signing(
         &signing_package,
         &signature_shares,
         &pk_package,
-        Some(signing_parameters),
+        signing_parameters,
     )
     .unwrap();
 
